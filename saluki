@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+if [ -x "$DIR/.venv/bin/python" ]; then
+  PYTHON="$DIR/.venv/bin/python"
+else
+  PYTHON="${PYTHON:-python3}"
+fi
+
+export PYTHONPATH="$DIR/src${PYTHONPATH:+:$PYTHONPATH}"
+exec "$PYTHON" -m saluki "$@"

@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "saluki"
+version = "0.1.0"
+description = "AI Co-Scientist — LangGraph + ChatOpenAI hypothesis explorer"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "LicenseRef-FSL-1.1-MIT"
+dependencies = [
+    "click>=8.3.3",
+    "deepagents>=0.5.7",
+    "httpx>=0.28.1",
+    "langchain-huggingface>=0.1.2",
+    "langchain-openai>=1.2.1",
+    "langgraph>=1.1.10",
+    "loguru>=0.7.3",
+    "pymupdf>=1.27.2.3",
+    "python-dotenv>=1.2.2",
+    "sentence-transformers>=5.0.0",
+    "tavily-python>=0.7.25",
+]
+
+[project.scripts]
+saluki = "saluki.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=saluki --cov-report=term-missing --cov-fail-under=80"
+
+[dependency-groups]
+dev = [
+    "coverage>=7.14.0",
+    "pytest>=9.0.3",
+    "pytest-cov>=7.1.0",
+    "ty>=0.0.39",
+]

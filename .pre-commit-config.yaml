@@ -1,0 +1,30 @@
+default_language_version:
+  python: python3.12
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.12
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+
+  - repo: https://github.com/psf/black-pre-commit-mirror
+    rev: 25.1.0
+    hooks:
+      - id: black
+
+  - repo: local
+    hooks:
+      - id: ty-check
+        name: ty
+        entry: scripts/ty_check.sh
+        language: system
+        pass_filenames: false
+        types_or: [python, pyi]
+
+      - id: sonarqube-quality-gate
+        name: SonarQube quality scan and gate
+        entry: scripts/sonar_scan.sh
+        language: system
+        pass_filenames: false
+        always_run: true

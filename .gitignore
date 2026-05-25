@@ -1,0 +1,16 @@
+__pycache__/
+.coverage
+.DS_Store
+.env
+coverage.xml
+*.py[oc]
+build/
+dist/
+docs/
+wheels/
+*.egg-info
+
+# Virtual environments
+.scannerwork/
+.venv/
+paper/
