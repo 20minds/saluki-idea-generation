@@ -281,7 +281,7 @@ class TestCLIPauseContinue:
             cli, "_run_with_supervisor", lambda **kw: _state(question="q")
         )
 
-        result = CliRunner().invoke(cli.main, ["-p", "q", "--pause"])
+        result = CliRunner().invoke(cli.main, ["generate", "-p", "q", "--pause"])
         assert "--persist-dir is required" not in result.output
 
     def test_continue_defaults_to_default_persist_dir(
@@ -295,7 +295,7 @@ class TestCLIPauseContinue:
         # report no state found rather than resuming a stray run from the real dir.
         monkeypatch.setattr(cli, "_DEFAULT_PERSIST_DIR", str(tmp_path))
 
-        result = CliRunner().invoke(cli.main, ["-p", "q", "--continue"])
+        result = CliRunner().invoke(cli.main, ["generate", "-p", "q", "--continue"])
         assert "--persist-dir is required" not in result.output
         assert "No persisted state found" in result.output
 
@@ -305,7 +305,7 @@ class TestCLIPauseContinue:
 
         result = CliRunner().invoke(
             cli.main,
-            ["-p", "q", "--continue", "--persist-dir", str(tmp_path)],
+            ["generate", "-p", "q", "--continue", "--persist-dir", str(tmp_path)],
         )
         assert result.exit_code != 0
         assert "No persisted state found" in result.output

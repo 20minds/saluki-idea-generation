@@ -9,6 +9,7 @@ from click.testing import CliRunner
 import saluki.cli as cli
 import saluki.deep_reflect as deep_reflect
 import saluki.idea_research as idea_research
+import saluki.ranking as ranking
 
 
 def test_cli_main_runs_with_fake_graph(monkeypatch) -> None:
@@ -29,7 +30,8 @@ def test_cli_main_runs_with_fake_graph(monkeypatch) -> None:
     )
 
     result = CliRunner().invoke(
-        cli.main, ["-p", "question", "-m", "gpt-4o-mini", "--no-task-queue"]
+        cli.main,
+        ["generate", "-p", "question", "-m", "gpt-4o-mini", "--no-task-queue"],
     )
     assert result.exit_code == 0
 
@@ -50,10 +52,63 @@ def test_cli_no_parallel_reaches_supervisor(monkeypatch) -> None:
 
     monkeypatch.setattr(cli, "_run_with_supervisor", fake_run_with_supervisor)
 
-    result = CliRunner().invoke(cli.main, ["-p", "question", "--no-parallel"])
+    result = CliRunner().invoke(
+        cli.main, ["generate", "-p", "question", "--no-parallel"]
+    )
 
     assert result.exit_code == 0
     assert captured["options"].no_parallel is True
+
+
+def test_cli_rank_reads_idea_file(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(cli, "_print_rank_results", lambda final: None)
+    idea_file = tmp_path / "ideas.md"
+    idea_file.write_text("# Ideas\n\nAlpha idea.\n\nBeta idea.\n", encoding="utf-8")
+    captured: dict[str, Any] = {}
+
+    def fake_rank_predefined_ideas(
+        ideas: list[str],
+        *,
+        prompt: str,
+        model: str,
+        max_matches_per_idea: int,
+        research: bool,
+        deep_review: bool,
+    ) -> ranking.CoScientistState:
+        captured["ideas"] = ideas
+        captured["prompt"] = prompt
+        captured["model"] = model
+        captured["max_matches_per_idea"] = max_matches_per_idea
+        captured["research"] = research
+        captured["deep_review"] = deep_review
+        state = ranking.new_state(prompt, max_rounds=1)
+        state["hypotheses"] = ranking.ideas_to_hypotheses(ideas)
+        return state
+
+    monkeypatch.setattr(ranking, "rank_predefined_ideas", fake_rank_predefined_ideas)
+
+    result = CliRunner().invoke(
+        cli.main,
+        [
+            "rank",
+            "--idea-file",
+            str(idea_file),
+            "--model",
+            "m",
+            "--max-matches-per-idea",
+            "2",
+            "--research",
+            "--deep-review",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured["ideas"] == ["Alpha idea.", "Beta idea."]
+    assert captured["model"] == "m"
+    assert captured["max_matches_per_idea"] == 2
+    assert captured["research"] is True
+    assert captured["deep_review"] is True
 
 
 def test_run_idea_research_uses_agent_and_extracts_text(monkeypatch) -> None:

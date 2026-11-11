@@ -3,9 +3,11 @@ import os
 from typing import Optional
 from pydantic import BaseModel, Field
 
-# Default model used when no --model flag is provided.
-# Can be overridden via the CLI flag or set in .env.
-DEFAULT_MODEL = os.environ.get("SALUKI_MODEL") or "gpt-5.4-mini"
+# Default model used when no --model flag is provided. Decide's deployment-wide
+# LLM_MODEL takes precedence; SALUKI_MODEL remains available for standalone use.
+DEFAULT_MODEL = (
+    os.environ.get("LLM_MODEL") or os.environ.get("SALUKI_MODEL") or "gpt-5.6-luna"
+)
 
 
 class GeneratedHypothesis(BaseModel):

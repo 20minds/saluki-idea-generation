@@ -2,10 +2,11 @@ from __future__ import annotations
 import json
 import os
 from collections import Counter
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from functools import lru_cache
 from itertools import combinations
-from typing import Any, cast
+from typing import Any, Callable, Literal, cast
 
 from langchain_openai import ChatOpenAI
 from loguru import logger
@@ -54,6 +55,15 @@ from .prompts import (
 # helpers
 # ---------------------------------------------------------------------------
 
+
+@dataclass(frozen=True)
+class GenerationProgress:
+    """Structured lifecycle update for incremental hypothesis generation."""
+
+    phase: Literal["generating", "debating", "complete"]
+    candidate_count: int
+
+
 NONE_YET_TEXT = "None yet."
 
 SIMILARITY_SKIP_THRESHOLD = 0.7  # tournament: skip pairs at or above this similarity
@@ -66,10 +76,7 @@ DUPLICATE_THRESHOLD = (
 INITIAL_ELO_SENTINEL = 0.0
 TOURNAMENT_START_ELO = 1200.0
 
-EMBEDDING_MODEL = "google/embeddinggemma-300m-qat-q4_0-unquantized"
-# EmbeddingGemma ships task-specific prompts; "STS" suits symmetric
-# hypothesis-to-hypothesis similarity (semantic textual similarity).
-EMBEDDING_PROMPT_NAME = "STS"
+EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 
 
 # Structured-output calls against small local models intermittently emit
@@ -77,6 +84,18 @@ EMBEDDING_PROMPT_NAME = "STS"
 STRUCTURED_RETRIES = 2
 STRUCTURED_RETRY_MIN_SECONDS = 2.0
 STRUCTURED_RETRY_MAX_SECONDS = 30.0
+
+COMPACT_INPUT_CHARS = int(os.environ.get("SALUKI_COMPACT_INPUT_CHARS", "12000"))
+IDEA_RESEARCH_SUMMARY_CHARS = int(
+    os.environ.get("SALUKI_IDEA_RESEARCH_SUMMARY_CHARS", "3000")
+)
+REFLECTION_SUMMARY_CHARS = int(os.environ.get("SALUKI_REFLECTION_SUMMARY_CHARS", "900"))
+META_REVIEW_SUMMARY_CHARS = int(
+    os.environ.get("SALUKI_META_REVIEW_SUMMARY_CHARS", "1200")
+)
+SYSTEM_FEEDBACK_SUMMARY_CHARS = int(
+    os.environ.get("SALUKI_SYSTEM_FEEDBACK_SUMMARY_CHARS", "1200")
+)
 
 
 def _llm(model: str, temperature: float = 0.7) -> ChatOpenAI:
@@ -92,18 +111,14 @@ def _llm(model: str, temperature: float = 0.7) -> ChatOpenAI:
     return ChatOpenAI(**kwargs)
 
 
-# Every known way to ask an OpenAI-compatible server to skip a model's
-# reasoning/thinking pass.  Sent together for structured-output calls so
-# whichever key a given local server honours takes effect; servers ignore the
-# ones that don't apply.  Not sent to the stock OpenAI endpoint, which rejects
-# unknown body params with a 400.
-DEFAULT_DISABLE_THINKING_BODY: dict[str, Any] = {
-    "reasoning_effort": "none",  # OpenAI-style effort knob
-    "reasoning": {"enabled": False},  # OpenRouter / gateways
-    "chat_template_kwargs": {"enable_thinking": False},  # vLLM / SGLang (Qwen3 etc.)
-    "enable_thinking": False,  # top-level flag (some servers)
-    "thinking": {"type": "disabled"},  # Anthropic-style via gateways
+VLLM_DISABLE_THINKING_BODY: dict[str, Any] = {
+    "chat_template_kwargs": {"enable_thinking": False},
 }
+
+
+def _compatibility_provider() -> str:
+    """Return the explicitly configured OpenAI-compatible server profile."""
+    return os.environ.get("SALUKI_OPENAI_COMPAT_PROVIDER", "auto").strip().lower()
 
 
 def _structured_extra_body() -> dict | None:
@@ -119,9 +134,10 @@ def _structured_extra_body() -> dict | None:
 
     * ``SALUKI_LLM_EXTRA_BODY`` set to JSON  → use it verbatim (override).
       Use ``'{}'`` to opt out (send nothing).
-    * unset, and a custom ``OPENAI_BASE_URL`` is configured → default to
-      :data:`DEFAULT_DISABLE_THINKING_BODY` (every known thinking-off toggle).
-    * unset, stock OpenAI endpoint → ``None`` (it 400s on unknown params).
+    * unset, and ``SALUKI_OPENAI_COMPAT_PROVIDER=vllm`` or ``sglang`` → use
+      the documented vLLM-style ``chat_template_kwargs`` thinking toggle.
+    * unset for ``auto``, ``openai``, or ``generic`` → send no non-standard
+      parameters. This is safe for stock OpenAI and arbitrary compatible APIs.
     """
     raw = os.environ.get("SALUKI_LLM_EXTRA_BODY")
     if raw:
@@ -130,8 +146,8 @@ def _structured_extra_body() -> dict | None:
         except json.JSONDecodeError as exc:
             logger.warning("ignoring invalid SALUKI_LLM_EXTRA_BODY: {}", exc)
             return None
-    if os.environ.get("OPENAI_BASE_URL"):
-        return dict(DEFAULT_DISABLE_THINKING_BODY)
+    if _compatibility_provider() in {"vllm", "sglang"}:
+        return dict(VLLM_DISABLE_THINKING_BODY)
     return None
 
 
@@ -273,6 +289,53 @@ def _message_text(message: object) -> str:
     return str(content).strip()
 
 
+def _compact_for_state(
+    text: str,
+    *,
+    label: str,
+    model: str,
+    max_chars: int,
+    guidance: str,
+) -> str:
+    """Summarize long text before storing it in shared state.
+
+    State fields are repeatedly fed into later prompts, so storing compact
+    summaries is the most effective place to control context growth.
+    """
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+
+    source = _truncate_text(text, COMPACT_INPUT_CHARS)
+    prompt = f"""\
+Summarize the following {label} for reuse as compact context in later LLM prompts.
+Keep the operational details that affect future hypothesis generation, review, or ranking.
+{guidance}
+
+Limit the summary to at most {max_chars} characters. Return only the summary.
+
+{label}:
+{source}
+"""
+    try:
+        summary = _message_text(_llm(model, temperature=0.0).invoke(prompt))
+    except Exception as exc:  # noqa: BLE001 - compaction must not break the run
+        logger.warning(
+            "compact | {} summarization failed, falling back to truncation: {}",
+            label,
+            _format_exception(exc),
+        )
+        return _truncate_text(text, max_chars)
+
+    summary = summary.strip()
+    if not summary:
+        return _truncate_text(text, max_chars)
+    if len(summary) > max_chars:
+        summary = _truncate_text(summary, max_chars)
+    logger.info("compact | {} {}→{} chars", label, len(text), len(summary))
+    return summary
+
+
 def _hypothesis_text(h: Hypothesis) -> str:
     return " ".join(
         part for part in [h["mechanism"], h["prediction"], h["experiment"]] if part
@@ -327,17 +390,14 @@ def _pair_similarity(h1_id: str, h2_id: str, proximity_graph: dict) -> float:
 
 @lru_cache(maxsize=1)
 def _embedder() -> Any:
-    """Load the EmbeddingGemma model once and cache it for the process.
+    """Load the FastEmbed model once and cache it for the process.
 
-    Kept lazy so importing this module never pulls in sentence-transformers /
-    torch unless embeddings are actually used.
+    Kept lazy so importing this module never initializes ONNX Runtime or
+    downloads the model unless embeddings are actually used.
     """
-    from langchain_huggingface import HuggingFaceEmbeddings
+    from fastembed import TextEmbedding
 
-    return HuggingFaceEmbeddings(
-        model_name=EMBEDDING_MODEL,
-        encode_kwargs={"prompt_name": EMBEDDING_PROMPT_NAME},
-    )
+    return TextEmbedding(model_name=EMBEDDING_MODEL)
 
 
 def _embed_texts(texts: list[str]) -> list[list[float]] | None:
@@ -350,7 +410,7 @@ def _embed_texts(texts: list[str]) -> list[list[float]] | None:
     if not texts:
         return None
     try:
-        return _embedder().embed_documents(texts)
+        return [vector.tolist() for vector in _embedder().embed(texts)]
     except Exception as exc:  # pragma: no cover - exercised via monkeypatch in tests
         logger.debug(
             "embeddings unavailable, falling back to lexical similarity: {}", exc
@@ -460,6 +520,16 @@ def idea_research_node(state: CoScientistState, *, model: str = "gpt-4o-mini") -
         existing=existing_text,
         feedback=feedback,
     )
+    brief = _compact_for_state(
+        brief,
+        label="idea research brief",
+        model=model,
+        max_chars=IDEA_RESEARCH_SUMMARY_CHARS,
+        guidance=(
+            "Preserve promising directions, key assumptions, risks, citations or named "
+            "prior-art signals, and suggested next experiments."
+        ),
+    )
     logger.info("idea_research | brief={:.120}", brief)
     return {"idea_research": brief}
 
@@ -494,7 +564,13 @@ def _build_hypothesis(obj: Any, h_id: str, generation: int) -> Hypothesis:
     }
 
 
-def generate_node(state: CoScientistState, *, model: str = "gpt-4o-mini") -> dict:
+def generate_node(
+    state: CoScientistState,
+    *,
+    model: str = "gpt-4o-mini",
+    on_hypothesis: Callable[[Hypothesis], None] | None = None,
+    on_progress: Callable[[GenerationProgress], None] | None = None,
+) -> dict:
     """Create initial hypotheses using two strategies (pseudocode CreateInitialHypotheses).
 
     Strategy 1 — literature-grounded: a web search supplies external context that is
@@ -503,6 +579,8 @@ def generate_node(state: CoScientistState, *, model: str = "gpt-4o-mini") -> dic
     """
     n_gen = 12
     round_num = state["round"]
+    if on_progress:
+        on_progress(GenerationProgress(phase="generating", candidate_count=0))
     logger.info("generate | round={} model={} n={}", round_num, model, n_gen)
 
     # Strategy 1 context: idea-research brief + live web literature.
@@ -552,8 +630,12 @@ def generate_node(state: CoScientistState, *, model: str = "gpt-4o-mini") -> dic
         h = _build_hypothesis(obj, h_text, round_num)
         items.append(h)
         logger.info("  {} | {}", h["id"], h["mechanism"][:120])
+        if on_hypothesis:
+            on_hypothesis(h)
 
     # Strategy 2: simulated expert debate → three consensus hypotheses.
+    if on_progress:
+        on_progress(GenerationProgress(phase="debating", candidate_count=len(items)))
     debate_tmpl = GENERATE_DEBATE + (NEGATIVE_SPACE_ADDON if negative_space else "")
     debate_llm = _structured(_llm(model), GeneratedHypothesis)
     for debate_idx in range(3):
@@ -578,6 +660,8 @@ def generate_node(state: CoScientistState, *, model: str = "gpt-4o-mini") -> dic
             logger.info(
                 "  {} (debate) | {}", debate_h["id"], debate_h["mechanism"][:120]
             )
+            if on_hypothesis:
+                on_hypothesis(debate_h)
         except Exception:  # noqa: BLE001 - debate hypothesis is optional
             logger.warning(
                 "generate | debate hypothesis {} failed after retries, skipping",
@@ -585,6 +669,8 @@ def generate_node(state: CoScientistState, *, model: str = "gpt-4o-mini") -> dic
             )
 
     logger.info("  generated {} hypotheses", len(items))
+    if on_progress:
+        on_progress(GenerationProgress(phase="complete", candidate_count=len(items)))
     return {
         "round": round_num,
         "hypotheses": items,
@@ -618,6 +704,16 @@ def reflect_node(state: CoScientistState, *, model: str = "gpt-4o-mini") -> dict
                 model=model,
                 subject=f"[{h['id']}] {h['mechanism']}",
             )
+            r = _compact_for_state(
+                r,
+                label=f"reflection {h['id']}",
+                model=model,
+                max_chars=REFLECTION_SUMMARY_CHARS,
+                guidance=(
+                    "Preserve novelty, feasibility, contradictions, strongest caveats, "
+                    "and the final judgment label."
+                ),
+            )
             reflections[h["id"]] = r
         # Merge: new reflections + cached reflections
         merged = []
@@ -645,6 +741,16 @@ def reflect_node(state: CoScientistState, *, model: str = "gpt-4o-mini") -> dict
         ),
     )
     reflection = _message_text(review)
+    reflection = _compact_for_state(
+        reflection,
+        label=f"reflection {h['id']}",
+        model=model,
+        max_chars=REFLECTION_SUMMARY_CHARS,
+        guidance=(
+            "Preserve novelty, feasibility, contradictions, strongest caveats, "
+            "and the final judgment label."
+        ),
+    )
     logger.info("reflect | {:.120}", reflection)
 
     merged = [{**h, "reflection": reflection} for h in state["hypotheses"]]
@@ -691,6 +797,71 @@ def _score_hypothesis(
     )
 
 
+def _neutral_scores() -> ScoreResult:
+    return ScoreResult(
+        novelty_score=0.5,
+        rigor_score=0.5,
+        testability_score=0.5,
+        impact_score=0.5,
+        simplicity_score=0.5,
+        reason="",
+    )
+
+
+def score_hypotheses(
+    state: CoScientistState,
+    hypotheses: list[Hypothesis],
+    *,
+    model: str = "gpt-4o-mini",
+    lit_text: str | None = None,
+    feedback: str | None = None,
+    prune_low_novelty: bool = True,
+    tolerate_errors: bool = False,
+    log_label: str = "score",
+) -> tuple[list[Hypothesis], list[str]]:
+    """Score hypotheses with the same five dimensions used throughout Saluki."""
+    if not hypotheses:
+        return [], []
+
+    lit_text = (
+        lit_text if lit_text is not None else _truncate_text(_context_text(state))
+    )
+    feedback = feedback if feedback is not None else _feedback_text(state)
+    scored: list[Hypothesis] = []
+    for h in hypotheses:
+        try:
+            scores = _score_hypothesis(h, lit_text, feedback, model)
+        except Exception as exc:
+            if not tolerate_errors:
+                raise
+            logger.warning(
+                "{} | id={} scoring failed, using neutral scores: {}",
+                log_label,
+                h["id"],
+                _format_exception(exc),
+            )
+            scores = _neutral_scores()
+        scored_h = _apply_scores(h, scores)
+        logger.info(
+            "{} | id={} scored novelty={:.2f} rigor={:.2f} testability={:.2f} impact={:.2f} simplicity={:.2f}",
+            log_label,
+            h["id"],
+            scored_h["novelty_score"],
+            scored_h["rigor_score"],
+            scored_h["testability_score"],
+            scored_h["impact_score"],
+            scored_h["simplicity_score"],
+        )
+        scored.append(scored_h)
+
+    pruned = (
+        [h["id"] for h in scored if h["novelty_score"] < NOVELTY_PRUNE_THRESHOLD]
+        if prune_low_novelty
+        else []
+    )
+    return scored, pruned
+
+
 def score_node(state: CoScientistState, *, model: str = "gpt-4o-mini") -> dict:
     active = _active(state)
     if not active:
@@ -699,17 +870,7 @@ def score_node(state: CoScientistState, *, model: str = "gpt-4o-mini") -> dict:
 
     logger.info("score | model={} n={}", model, len(active))
 
-    lit_text = _truncate_text(_context_text(state))
-    feedback = _feedback_text(state)
-
-    merged: list[Hypothesis] = [
-        _apply_scores(h, _score_hypothesis(h, lit_text, feedback, model))
-        for h in active
-    ]
-
-    pruned: list[str] = [
-        h["id"] for h in merged if h["novelty_score"] < NOVELTY_PRUNE_THRESHOLD
-    ]
+    merged, pruned = score_hypotheses(state, active, model=model)
 
     logger.info("score | done pruned={}", pruned)
     result: dict = {"hypotheses": merged}
@@ -789,6 +950,16 @@ def review_hypothesis_node(
     # hypothesis still proceeds to the tournament.
     try:
         reflection = _reflection_text(target, state, lit_text, model)
+        reflection = _compact_for_state(
+            reflection,
+            label=f"review reflection {target_id}",
+            model=model,
+            max_chars=REFLECTION_SUMMARY_CHARS,
+            guidance=(
+                "Preserve novelty, feasibility, contradictions, strongest caveats, "
+                "and the final judgment label."
+            ),
+        )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "review | id={} reflection failed, using empty critique: {}",
@@ -796,22 +967,17 @@ def review_hypothesis_node(
             _format_exception(exc),
         )
         reflection = ""
-    try:
-        scores = _score_hypothesis(target, lit_text, _feedback_text(state), model)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "review | id={} scoring failed, using neutral scores: {}",
-            target_id,
-            _format_exception(exc),
-        )
-        scores = ScoreResult(
-            novelty_score=0.5,
-            rigor_score=0.5,
-            testability_score=0.5,
-            impact_score=0.5,
-            simplicity_score=0.5,
-            reason="",
-        )
+    scored, _ = score_hypotheses(
+        state,
+        [target],
+        model=model,
+        lit_text=lit_text,
+        feedback=_feedback_text(state),
+        prune_low_novelty=False,
+        tolerate_errors=True,
+        log_label="review",
+    )
+    scored_target = scored[0]
     try:
         verification = _verify_hypothesis(target, lit_text, model)
     except Exception as exc:  # noqa: BLE001
@@ -831,7 +997,7 @@ def review_hypothesis_node(
     ).strip()
 
     updated: Hypothesis = {
-        **_apply_scores(target, scores),
+        **scored_target,
         "reflection": reflection,
         "verification": verification_summary,
     }
@@ -842,11 +1008,11 @@ def review_hypothesis_node(
             "hypothesis_id": target_id,
             "review": reflection,
             "scores": {
-                "novelty": scores.novelty_score,
-                "rigor": scores.rigor_score,
-                "testability": scores.testability_score,
-                "impact": scores.impact_score,
-                "simplicity": scores.simplicity_score,
+                "novelty": scored_target["novelty_score"],
+                "rigor": scored_target["rigor_score"],
+                "testability": scored_target["testability_score"],
+                "impact": scored_target["impact_score"],
+                "simplicity": scored_target["simplicity_score"],
             },
         },
         {
@@ -866,7 +1032,7 @@ def review_hypothesis_node(
         "reviews": reviews,
         "reviewed_id": target_id,
     }
-    if scores.novelty_score < NOVELTY_PRUNE_THRESHOLD:
+    if scored_target["novelty_score"] < NOVELTY_PRUNE_THRESHOLD:
         logger.info("review | pruning low-novelty [{}]", target_id)
         result["pruned_ids"] = list(set(state.get("pruned_ids") or []) | {target_id})
         # A pruned hypothesis does not proceed to the tournament.
@@ -1470,6 +1636,16 @@ def meta_review_node(state: CoScientistState, *, model: str = "gpt-4o-mini") -> 
         )
     )
     review = _message_text(review_message)
+    review = _compact_for_state(
+        review,
+        label="meta-review",
+        model=model,
+        max_chars=META_REVIEW_SUMMARY_CHARS,
+        guidance=(
+            "Preserve the emerging patterns, strongest directions, recurring weaknesses, "
+            "and gaps that should influence the next round."
+        ),
+    )
     logger.info("meta_review | {:.120}", review)
 
     from .display import print_hypotheses
@@ -1515,6 +1691,16 @@ def system_feedback_node(
         )
     )
     feedback = _message_text(feedback_message)
+    feedback = _compact_for_state(
+        feedback,
+        label="system feedback",
+        model=model,
+        max_chars=SYSTEM_FEEDBACK_SUMMARY_CHARS,
+        guidance=(
+            "Preserve only actionable guidance that should steer future generation, "
+            "review, and tournament decisions."
+        ),
+    )
     logger.info("system_feedback | {:.120}", feedback)
 
     return {"system_wide_feedback": feedback}

@@ -6,7 +6,7 @@ ranking, evolve stronger variants, and print the active ideas plus any final
 overview.
 
 ```sh
-uv run saluki --prompt "What is an Ig Nobel worthy research topic?"
+uv run saluki generate --prompt "What is an Ig Nobel worthy research topic?"
 ```
 
 ```
@@ -60,24 +60,35 @@ OPENAI_BASE_URL=http://127.0.0.1:8080/v1
 You can put that in `.env`, pass it with `--base-url`, or export it in your
 shell.
 
+For vLLM or SGLang servers hosting Qwen-style reasoning models, opt into their
+chat-template extension explicitly:
+
+```sh
+SALUKI_OPENAI_COMPAT_PROVIDER=vllm
+```
+
+Saluki otherwise sends only standard OpenAI-compatible request fields. Use
+`SALUKI_LLM_EXTRA_BODY` only when your specific server documents additional
+request parameters.
+
 ## Run
 
 Use the installed console script through `uv`:
 
 ```sh
-uv run saluki --prompt "What is an Ig Nobel worthy research topic?"
+uv run saluki generate --prompt "What is an Ig Nobel worthy research topic?"
 ```
 
 Or use the repository wrapper:
 
 ```sh
-./saluki --prompt "What is an Ig Nobel worthy research topic?"
+./saluki generate --prompt "What is an Ig Nobel worthy research topic?"
 ```
 
 Useful options:
 
 ```sh
-uv run saluki \
+uv run saluki generate \
   --prompt "What are promising biomarkers for early sepsis detection?" \
   --model gpt-5.5 \
   --rounds 100 \
@@ -101,6 +112,39 @@ Common flags:
 - `--no-parallel`: execute task-queue work one task at a time.
 - `--no-task-queue`: use the deprecated LangGraph pipeline.
 
+## Rank Predefined Ideas
+
+Put each idea in a separate Markdown paragraph, then assign the same five
+quality scores used by `generate` and run an Elo tournament over that fixed set:
+
+```sh
+./saluki rank --idea-file ideas.md
+```
+
+For more grounded scoring, reuse the setup research from `generate` before
+ranking:
+
+```sh
+./saluki rank --idea-file ideas.md --research
+```
+
+For the slowest, most thorough path, review each idea before ranking. This
+reuses the per-idea review, evidence, verification, and scoring flow from
+`generate`, while keeping every predefined idea in the tournament:
+
+```sh
+./saluki rank --idea-file ideas.md --research --deep-review
+```
+
+Useful options:
+
+- `--prompt`, `-p`: ranking goal or criteria.
+- `--model`, `-m`: OpenAI model name.
+- `--max-matches-per-idea`: minimum tournament matches per idea.
+- `--research`: run shared bootstrap and idea-research setup before scoring.
+- `--deep-review`: run the per-idea review path before ranking instead of the
+  lightweight score-only pass.
+
 ## Pause And Resume
 
 Saluki persists task-queue state under `~/.saluki/states` by default.
@@ -108,20 +152,20 @@ Saluki persists task-queue state under `~/.saluki/states` by default.
 Pause after a productive cycle:
 
 ```sh
-uv run saluki --prompt "New research question" --pause
+uv run saluki generate --prompt "New research question" --pause
 ```
 
 Resume the most recent persisted run:
 
 ```sh
-uv run saluki --prompt "ignored while resuming" --continue
+uv run saluki generate --prompt "ignored while resuming" --continue
 ```
 
 Use a custom persistence directory:
 
 ```sh
-uv run saluki --prompt "New research question" --persist-dir ./runs --pause
-uv run saluki --prompt "ignored while resuming" --persist-dir ./runs --continue
+uv run saluki generate --prompt "New research question" --persist-dir ./runs --pause
+uv run saluki generate --prompt "ignored while resuming" --persist-dir ./runs --continue
 ```
 
 When resuming, the stored question is used; the new `--prompt` is ignored.

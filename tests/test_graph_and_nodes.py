@@ -98,6 +98,40 @@ def test_idea_and_reflect_nodes(monkeypatch) -> None:
     assert out["hypotheses"][0]["reflection"] == "reflection"
 
 
+def test_idea_research_node_summarizes_long_brief_before_storing(monkeypatch) -> None:
+    long_brief = "Long brief sentence. " * 200
+    fake_llm = DummyLLM(SimpleNamespace(content="compact research summary"))
+    monkeypatch.setattr(nodes, "run_idea_research", lambda **kwargs: long_brief)
+    monkeypatch.setattr(nodes, "_llm", lambda *args, **kwargs: fake_llm)
+    monkeypatch.setattr(nodes, "IDEA_RESEARCH_SUMMARY_CHARS", 80)
+
+    out = idea_research_node(
+        _state(question="q", hypotheses=[], meta_review="", idea_research=""),
+        model="m",
+    )
+
+    assert out == {"idea_research": "compact research summary"}
+    assert "Long brief sentence" in fake_llm.prompts[0]
+
+
+def test_compaction_falls_back_to_truncation_when_summary_fails(monkeypatch) -> None:
+    class FailingLLM:
+        def invoke(self, _prompt: str) -> object:
+            raise RuntimeError("no model")
+
+    monkeypatch.setattr(nodes, "_llm", lambda *args, **kwargs: FailingLLM())
+
+    out = nodes._compact_for_state(
+        "alpha beta gamma delta",
+        label="test text",
+        model="m",
+        max_chars=12,
+        guidance="Keep the important parts.",
+    )
+
+    assert out == "alpha beta..."
+
+
 def test_score_and_proximity_nodes(monkeypatch) -> None:
     score_result = ns(
         novelty_score=0.1,
@@ -124,6 +158,36 @@ def test_score_and_proximity_nodes(monkeypatch) -> None:
     )
     assert "a" in prox["proximity_graph"]
     assert prox["proximity_graph"]["a"][0]["id"] == "b"
+
+
+def test_score_hypotheses_logs_each_scored_idea(monkeypatch) -> None:
+    score_result = ns(
+        novelty_score=0.9,
+        rigor_score=0.8,
+        testability_score=0.7,
+        impact_score=0.6,
+        simplicity_score=0.5,
+        reason="ok",
+    )
+    logged: list[str] = []
+
+    monkeypatch.setattr(nodes, "_llm", lambda *args, **kwargs: DummyLLM(score_result))
+    monkeypatch.setattr(
+        nodes.logger,
+        "info",
+        lambda msg, *args: logged.append(msg.format(*args)),
+    )
+
+    nodes.score_hypotheses(
+        _state(question="q"),
+        [_hypothesis("a")],
+        model="m",
+        log_label="rank",
+    )
+
+    assert logged == [
+        "rank | id=a scored novelty=0.90 rigor=0.80 testability=0.70 impact=0.60 simplicity=0.50"
+    ]
 
 
 def test_tournament_helpers_and_node(monkeypatch) -> None:
@@ -556,11 +620,20 @@ def test_generate_node_injects_web_search_and_debate(monkeypatch) -> None:
 
     monkeypatch.setattr(nodes, "_llm", lambda *a, **k: CapLLM())
     state = _state(question="Q", round=0, research_plan={"keywords": ["k1"]})
-    out = generate_node(state, model="m")
+    streamed: list[str] = []
+    progress: list[tuple[str, int]] = []
+    out = generate_node(
+        state,
+        model="m",
+        on_hypothesis=lambda hypothesis: streamed.append(hypothesis["id"]),
+        on_progress=lambda event: progress.append((event.phase, event.candidate_count)),
+    )
 
     # 12 standard + 3 debate strategy = 15 ideas, none yet in the tournament.
     assert len(out["hypotheses"]) == 15
     assert out["new_hypothesis_ids"] == [h["id"] for h in out["hypotheses"]]
+    assert streamed == out["new_hypothesis_ids"]
+    assert progress == [("generating", 0), ("debating", 12), ("complete", 15)]
     assert all(
         h["in_tournament"] is False and h["elo"] == 0.0 for h in out["hypotheses"]
     )
@@ -797,16 +870,24 @@ def test_structured_extra_body_invalid_env_is_ignored(monkeypatch) -> None:
     assert nodes._structured_extra_body() is None
 
 
-def test_structured_extra_body_defaults_to_disable_thinking_for_local(
+def test_structured_extra_body_defaults_to_none_for_generic_compatible_server(
     monkeypatch,
 ) -> None:
     monkeypatch.delenv("SALUKI_LLM_EXTRA_BODY", raising=False)
+    monkeypatch.delenv("SALUKI_OPENAI_COMPAT_PROVIDER", raising=False)
     monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:8080/v1")
-    assert nodes._structured_extra_body() == nodes.DEFAULT_DISABLE_THINKING_BODY
+    assert nodes._structured_extra_body() is None
+
+
+def test_structured_extra_body_uses_vllm_profile(monkeypatch) -> None:
+    monkeypatch.delenv("SALUKI_LLM_EXTRA_BODY", raising=False)
+    monkeypatch.setenv("SALUKI_OPENAI_COMPAT_PROVIDER", "vllm")
+    assert nodes._structured_extra_body() == nodes.VLLM_DISABLE_THINKING_BODY
 
 
 def test_structured_extra_body_none_for_stock_openai(monkeypatch) -> None:
     monkeypatch.delenv("SALUKI_LLM_EXTRA_BODY", raising=False)
+    monkeypatch.delenv("SALUKI_OPENAI_COMPAT_PROVIDER", raising=False)
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     assert nodes._structured_extra_body() is None
 

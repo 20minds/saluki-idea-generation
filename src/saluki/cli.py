@@ -1,6 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 import os
+from pathlib import Path
 import sys
 from typing import Any, cast
 
@@ -8,6 +9,7 @@ import click
 from dotenv import load_dotenv
 from loguru import logger
 
+from .schemas import DEFAULT_MODEL
 from .state import CoScientistState, new_state
 from .task_queue import restore_state, _DEFAULT_PERSIST_DIR
 
@@ -59,6 +61,19 @@ class SupervisorOptions:
     no_parallel: bool = False
 
 
+@dataclass(frozen=True)
+class RankOptions:
+    idea_file: Path
+    prompt: str
+    model: str
+    verbose: bool
+    base_url: str | None
+    api_key: str | None
+    max_matches_per_idea: int
+    research: bool
+    deep_review: bool
+
+
 def _configure_logging(verbose: bool) -> None:
     logger.remove()
     level = "DEBUG" if verbose else "INFO"
@@ -100,12 +115,42 @@ def _print_results(final: CoScientistState) -> None:
     click.echo("=" * 70)
 
 
-@click.command()
+def _print_rank_results(final: CoScientistState) -> None:
+    from .ranking import ranked_hypotheses
+
+    click.echo("\n" + "=" * 70)
+    click.echo("  RANKED IDEAS")
+    click.echo("=" * 70)
+
+    for index, hypothesis in enumerate(ranked_hypotheses(final), 1):
+        click.echo(
+            f"\n#{index}  [{hypothesis['id']}]  "
+            f"Elo: {hypothesis.get('elo', 0.0):.0f}  "
+            f"Matches: {hypothesis.get('matches', 0)}"
+        )
+        click.echo(
+            f"Scores — novelty: {hypothesis['novelty_score']:.2f}  "
+            f"rigor: {hypothesis['rigor_score']:.2f}  "
+            f"testability: {hypothesis['testability_score']:.2f}  "
+            f"impact: {hypothesis['impact_score']:.2f}  "
+            f"simplicity: {hypothesis['simplicity_score']:.2f}"
+        )
+        click.echo(hypothesis["mechanism"])
+
+    click.echo("=" * 70)
+
+
+@click.group()
+def main() -> None:
+    """Saluki command line interface."""
+
+
+@main.command()
 @click.option("--prompt", "-p", required=True, help="Research question to explore.")
 @click.option(
     "--model",
     "-m",
-    default="gpt-4o-mini",
+    default=DEFAULT_MODEL,
     show_default=True,
     help="OpenAI model name (e.g. gpt-4o, gpt-4o-mini, o1-mini).",
 )
@@ -202,10 +247,73 @@ def _print_results(final: CoScientistState) -> None:
     type=click.IntRange(1),
     help="Target tournament matches per idea before finishing (pseudocode MaxMatchesPerIdea).",
 )
-def main(**kwargs: Any) -> None:
+def generate(**kwargs: Any) -> None:
     """Saluki — AI Co-Scientist (LangGraph pipeline or task-queue supervisor)."""
     options = CliOptions(**kwargs)
     _run_cli(options)
+
+
+@main.command()
+@click.option(
+    "--idea-file",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Markdown file containing blank-line-separated idea paragraphs.",
+)
+@click.option(
+    "--prompt",
+    "-p",
+    default=None,
+    show_default=False,
+    help="Ranking goal or criteria. Defaults to a general quality ranking.",
+)
+@click.option(
+    "--model",
+    "-m",
+    default=DEFAULT_MODEL,
+    show_default=True,
+    help="OpenAI model name (e.g. gpt-4o, gpt-4o-mini, o1-mini).",
+)
+@click.option("--verbose", "-v", is_flag=True, help="DEBUG-level logs.")
+@click.option(
+    "--base-url",
+    default=None,
+    show_default=False,
+    help="OpenAI-compatible API base URL (e.g. http://localhost:8080/v1).",
+)
+@click.option(
+    "--api-key",
+    default=None,
+    show_default=False,
+    help="OpenAI API key (sk-...). Overrides OPENAI_API_KEY env var.",
+)
+@click.option(
+    "--max-matches-per-idea",
+    default=4,
+    show_default=True,
+    type=click.IntRange(1),
+    help="Run tournament batches until every idea has at least this many matches.",
+)
+@click.option(
+    "--research",
+    is_flag=True,
+    default=False,
+    help="Run the shared bootstrap and idea-research setup before scoring.",
+)
+@click.option(
+    "--deep-review",
+    is_flag=True,
+    default=False,
+    help="Use the per-idea review path before ranking instead of lightweight scoring.",
+)
+def rank(**kwargs: Any) -> None:
+    """Rank predefined ideas from a Markdown file with the Elo tournament."""
+    from .ranking import DEFAULT_RANK_PROMPT
+
+    if kwargs["prompt"] is None:
+        kwargs["prompt"] = DEFAULT_RANK_PROMPT
+    options = RankOptions(**kwargs)
+    _run_rank_cli(options)
 
 
 def _run_cli(options: CliOptions) -> None:
@@ -265,6 +373,41 @@ def _run_cli(options: CliOptions) -> None:
         ),
     )
     _print_results(final)
+
+
+def _run_rank_cli(options: RankOptions) -> None:
+    from .ranking import parse_markdown_ideas, rank_predefined_ideas
+
+    _configure_logging(options.verbose)
+    if options.api_key:
+        os.environ["OPENAI_API_KEY"] = options.api_key
+
+    _require_api_key()
+
+    if options.base_url:
+        os.environ["OPENAI_BASE_URL"] = options.base_url
+
+    ideas = parse_markdown_ideas(options.idea_file.read_text(encoding="utf-8"))
+    if len(ideas) < 2:
+        raise click.ClickException("Need at least two idea paragraphs to rank.")
+
+    logger.info(
+        "ranking | ideas={} model={} max_matches_per_idea={} research={} deep_review={}",
+        len(ideas),
+        options.model,
+        options.max_matches_per_idea,
+        options.research,
+        options.deep_review,
+    )
+    final = rank_predefined_ideas(
+        ideas,
+        prompt=options.prompt,
+        model=options.model,
+        max_matches_per_idea=options.max_matches_per_idea,
+        research=options.research,
+        deep_review=options.deep_review,
+    )
+    _print_rank_results(final)
 
 
 def _supervisor_options(

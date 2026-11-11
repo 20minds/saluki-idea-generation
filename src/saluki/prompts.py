@@ -40,6 +40,13 @@ wrap it under an id key; do NOT return a list. Each value is exactly one sentenc
   "prediction": "<the expected outcome if pursued>",
   "experiment": "<the simplest way to validate the hypothesis>"
 }}
+
+Example of the required field names:
+{{
+  "mechanism": "A targeted onboarding checklist improves activation by reducing uncertainty at the first point of setup.",
+  "prediction": "New users who receive the checklist will complete setup more often than users who receive generic welcome text.",
+  "experiment": "Randomly assign new users to checklist or control onboarding and compare setup completion within seven days."
+}}
 """
 
 GENERATE_DECISION = """\
@@ -69,6 +76,16 @@ wrap it under an id key; do NOT return a list. Each value is exactly one sentenc
   "for_whom":   "<who this decision targets, their need, and why they benefit>",
   "reversal_condition": "<the measurable condition that would reverse this decision, e.g. 'Reverse if 30-day retention drops below 40%'>"
 }}
+
+Example of the required field names:
+{{
+  "mechanism": "A targeted onboarding checklist improves activation by reducing uncertainty at the first point of setup.",
+  "prediction": "New users who receive the checklist will complete setup more often than users who receive generic welcome text.",
+  "experiment": "Randomly assign new users to checklist or control onboarding and compare setup completion within seven days.",
+  "decision": "Launch a targeted onboarding checklist for new users.",
+  "for_whom": "New users who need setup guidance benefit from a clearer first-session path.",
+  "reversal_condition": "Reverse if seven-day setup completion does not improve after two weeks."
+}}
 """
 
 GENERATE_DEBATE = """\
@@ -97,6 +114,13 @@ wrap it under an id key; do NOT return a list. Each value is exactly one sentenc
   "mechanism":  "<the core insight the debate converged on>",
   "prediction": "<the expected outcome if pursued>",
   "experiment": "<the simplest way to validate it>"
+}}
+
+Example of the required field names:
+{{
+  "mechanism": "A targeted onboarding checklist improves activation by reducing uncertainty at the first point of setup.",
+  "prediction": "New users who receive the checklist will complete setup more often than users who receive generic welcome text.",
+  "experiment": "Randomly assign new users to checklist or control onboarding and compare setup completion within seven days."
 }}
 """
 
